@@ -24,6 +24,7 @@ import scala.collection.mutable.ArrayBuffer
 import scala.collection.mutable
 
 import com.google.common.io.ByteStreams
+import com.tdunning.math.stats.TDigest
 
 import org.apache.spark._
 import org.apache.spark.memory.TaskMemoryManager
@@ -98,6 +99,15 @@ private[spark] class ExternalSorter[K, V, C](
   override protected[this] def taskMemoryManager: TaskMemoryManager = context.taskMemoryManager()
 
   private val conf = SparkEnv.get.conf
+
+  /* tdigest instrumentation */ 
+  val tdigestCompress = conf.getInt ("spark.optimizer.tdigest.compress", 100)
+  val tdigest: TDigest = TDigest.createAvlTreeDigest (tdigestCompress)
+  private def costFunc(k: Any, v: Any) = 1
+  private def insertInDigest(k: Any, v: Any) = {
+    tdigest.add (k.hashCode.toDouble, costFunc(k,v))
+  }
+  /****/
 
   private val numPartitions = partitioner.map(_.numPartitions).getOrElse(1)
   private val shouldPartition = numPartitions > 1
@@ -656,7 +666,8 @@ private[spark] class ExternalSorter[K, V, C](
           context.taskMetrics.shuffleWriteMetrics.get)
         val partitionId = it.nextPartition()
         while (it.hasNext && it.nextPartition() == partitionId) {
-          it.writeNext(writer)
+          val ((_,k), v) = it.writeNext(writer)
+          insertInDigest (k, v)
         }
         writer.commitAndClose()
         val segment = writer.fileSegment()
@@ -670,6 +681,7 @@ private[spark] class ExternalSorter[K, V, C](
             context.taskMetrics.shuffleWriteMetrics.get)
           for (elem <- elements) {
             writer.write(elem._1, elem._2)
+            insertInDigest (elem._1, elem._2)
           }
           writer.commitAndClose()
           val segment = writer.fileSegment()

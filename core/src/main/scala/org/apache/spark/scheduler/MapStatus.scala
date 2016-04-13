@@ -18,8 +18,10 @@
 package org.apache.spark.scheduler
 
 import java.io.{Externalizable, ObjectInput, ObjectOutput}
+import java.nio.ByteBuffer
 
 import org.roaringbitmap.RoaringBitmap
+import com.tdunning.math.stats.{TDigest, AVLTreeDigest}
 
 import org.apache.spark.storage.BlockManagerId
 import org.apache.spark.util.Utils
@@ -39,10 +41,51 @@ private[spark] sealed trait MapStatus {
    * necessary for correctness, since block fetchers are allowed to skip zero-size blocks.
    */
   def getSizeForBlock(reduceId: Int): Long
+
+  def tdigestOpt: Option[TDigest]
+  def unsetTDigest: Unit
+
+  def getTDigestSize: Long = tdigestOpt match {
+    case Some(tdigest) => tdigest.size
+    case None => 0
+  }
+
+  def getTDigest: Option[TDigest] = tdigestOpt
+
+  def writeTDigest(out: ObjectOutput) = getTDigest match {
+    case Some(tdigest) =>
+      val buf = ByteBuffer.allocate(tdigest.byteSize)
+      tdigest.asSmallBytes(buf)
+      out.writeInt(buf.array.length)
+      out.write(buf.array)
+    case None =>
+      out.writeInt(0)
+  }
+
+  def readTDigest(in: ObjectInput): Option[TDigest] = {
+    // read tdigest
+    val tdigestLen = in.readInt()
+    if (tdigestLen > 0) {
+      val bytes = new Array[Byte](tdigestLen)
+      in.readFully (bytes)
+      Some(AVLTreeDigest.fromBytes(ByteBuffer.wrap(bytes)))
+    } else {
+      None
+    }
+  }
 }
 
 
 private[spark] object MapStatus {
+
+  def apply(loc: BlockManagerId, uncompressedSizes: Array[Long], tdigest: TDigest): MapStatus = {
+    if (uncompressedSizes.length > 2000) {
+      HighlyCompressedMapStatus(loc, uncompressedSizes, tdigest)
+    } else {
+      new CompressedMapStatus(loc, uncompressedSizes, tdigest)
+
+    }
+  }
 
   def apply(loc: BlockManagerId, uncompressedSizes: Array[Long]): MapStatus = {
     if (uncompressedSizes.length > 2000) {
@@ -51,6 +94,7 @@ private[spark] object MapStatus {
       new CompressedMapStatus(loc, uncompressedSizes)
     }
   }
+
 
   private[this] val LOG_BASE = 1.1
 
@@ -91,13 +135,18 @@ private[spark] object MapStatus {
  */
 private[spark] class CompressedMapStatus(
     private[this] var loc: BlockManagerId,
-    private[this] var compressedSizes: Array[Byte])
+    private[this] var compressedSizes: Array[Byte],
+    private[this] var _tdigestOpt: Option[TDigest])
   extends MapStatus with Externalizable {
 
-  protected def this() = this(null, null.asInstanceOf[Array[Byte]])  // For deserialization only
+  protected def this() = this(null, null.asInstanceOf[Array[Byte]], null)  // For deserialization only
 
   def this(loc: BlockManagerId, uncompressedSizes: Array[Long]) {
-    this(loc, uncompressedSizes.map(MapStatus.compressSize))
+    this(loc, uncompressedSizes.map(MapStatus.compressSize), None)
+  }
+
+  def this(loc: BlockManagerId, uncompressedSizes: Array[Long], tdigest: TDigest) {
+    this(loc, uncompressedSizes.map(MapStatus.compressSize), Some(tdigest))
   }
 
   override def location: BlockManagerId = loc
@@ -105,11 +154,18 @@ private[spark] class CompressedMapStatus(
   override def getSizeForBlock(reduceId: Int): Long = {
     MapStatus.decompressSize(compressedSizes(reduceId))
   }
+  
+  override def tdigestOpt = _tdigestOpt
+
+  override def unsetTDigest: Unit = {
+    _tdigestOpt = None
+  }
 
   override def writeExternal(out: ObjectOutput): Unit = Utils.tryOrIOException {
     loc.writeExternal(out)
     out.writeInt(compressedSizes.length)
     out.write(compressedSizes)
+    writeTDigest (out)
   }
 
   override def readExternal(in: ObjectInput): Unit = Utils.tryOrIOException {
@@ -117,6 +173,7 @@ private[spark] class CompressedMapStatus(
     val len = in.readInt()
     compressedSizes = new Array[Byte](len)
     in.readFully(compressedSizes)
+    _tdigestOpt = readTDigest(in)
   }
 }
 
@@ -133,14 +190,28 @@ private[spark] class HighlyCompressedMapStatus private (
     private[this] var loc: BlockManagerId,
     private[this] var numNonEmptyBlocks: Int,
     private[this] var emptyBlocks: RoaringBitmap,
-    private[this] var avgSize: Long)
+    private[this] var avgSize: Long,
+    private[this] var _tdigestOpt: Option[TDigest])
   extends MapStatus with Externalizable {
 
   // loc could be null when the default constructor is called during deserialization
   require(loc == null || avgSize > 0 || numNonEmptyBlocks == 0,
     "Average size can only be zero for map stages that produced no output")
 
-  protected def this() = this(null, -1, null, -1)  // For deserialization only
+  protected def this() = this(null, -1, null, -1, null.asInstanceOf[Option[TDigest]])  // For deserialization only
+  
+  protected def this(
+    loc: BlockManagerId,
+    numNonEmptyBlocks: Int,
+    emptyBlocks: RoaringBitmap,
+    avgSize: Long) = this (loc, numNonEmptyBlocks, emptyBlocks, avgSize, None)
+
+  protected def this(
+    loc: BlockManagerId,
+    numNonEmptyBlocks: Int,
+    emptyBlocks: RoaringBitmap,
+    avgSize: Long,
+    tdigest: TDigest) = this (loc, numNonEmptyBlocks, emptyBlocks, avgSize, Some(tdigest))
 
   override def location: BlockManagerId = loc
 
@@ -152,10 +223,17 @@ private[spark] class HighlyCompressedMapStatus private (
     }
   }
 
+  override def tdigestOpt = _tdigestOpt
+
+  override def unsetTDigest: Unit = {
+    _tdigestOpt = None
+  }
+
   override def writeExternal(out: ObjectOutput): Unit = Utils.tryOrIOException {
     loc.writeExternal(out)
     emptyBlocks.writeExternal(out)
     out.writeLong(avgSize)
+    writeTDigest (out)
   }
 
   override def readExternal(in: ObjectInput): Unit = Utils.tryOrIOException {
@@ -163,11 +241,22 @@ private[spark] class HighlyCompressedMapStatus private (
     emptyBlocks = new RoaringBitmap()
     emptyBlocks.readExternal(in)
     avgSize = in.readLong()
+    _tdigestOpt = readTDigest(in)
   }
 }
 
 private[spark] object HighlyCompressedMapStatus {
-  def apply(loc: BlockManagerId, uncompressedSizes: Array[Long]): HighlyCompressedMapStatus = {
+
+  def apply(loc: BlockManagerId, uncompressedSizes: Array[Long]): HighlyCompressedMapStatus =
+    compressAndCreate(loc, uncompressedSizes, None)
+
+  def apply(loc: BlockManagerId, uncompressedSizes: Array[Long], tdigest: TDigest): HighlyCompressedMapStatus =
+    compressAndCreate(loc, uncompressedSizes, Some(tdigest))
+
+  private def compressAndCreate(
+      loc: BlockManagerId,
+      uncompressedSizes: Array[Long],
+      tdigestOpt: Option[TDigest]): HighlyCompressedMapStatus = {
     // We must keep track of which blocks are empty so that we don't report a zero-sized
     // block as being non-empty (or vice-versa) when using the average block size.
     var i = 0
@@ -195,6 +284,6 @@ private[spark] object HighlyCompressedMapStatus {
     }
     emptyBlocks.trim()
     emptyBlocks.runOptimize()
-    new HighlyCompressedMapStatus(loc, numNonEmptyBlocks, emptyBlocks, avgSize)
+    new HighlyCompressedMapStatus(loc, numNonEmptyBlocks, emptyBlocks, avgSize, tdigestOpt)
   }
 }

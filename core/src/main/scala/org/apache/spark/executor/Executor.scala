@@ -22,6 +22,7 @@ import java.lang.management.ManagementFactory
 import java.net.URL
 import java.nio.ByteBuffer
 import java.util.concurrent.{ConcurrentHashMap, TimeUnit}
+import scala.concurrent.duration._
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable.{ArrayBuffer, HashMap}
@@ -35,6 +36,9 @@ import org.apache.spark.scheduler.{DirectTaskResult, IndirectTaskResult, Task}
 import org.apache.spark.shuffle.FetchFailedException
 import org.apache.spark.storage.{StorageLevel, TaskResultBlockId}
 import org.apache.spark.util._
+
+import akka.actor.{Actor, ActorSystem, Inbox, Props}
+import akka.util.Timeout
 
 /**
  * Spark executor, backed by a threadpool to run tasks.
@@ -80,6 +84,11 @@ private[spark] class Executor(
   // Start worker thread pool
   private val threadPool = ThreadUtils.newDaemonCachedThreadPool("Executor task launch worker")
   private val executorSource = new ExecutorSource(threadPool, executorId)
+
+  // Start akka actor system
+  private val actorSystem = ActorSystem(s"akkaSystem-executor-${executorId}")
+  private val statsAggregator = actorSystem.actorOf(Props[StatsAggregator], "statsAggregator")
+  private val timeout = Duration(1, SECONDS)
 
   if (!isLocal) {
     env.metricsSystem.registerSource(executorSource)
@@ -140,6 +149,7 @@ private[spark] class Executor(
     heartbeater.shutdown()
     heartbeater.awaitTermination(10, TimeUnit.SECONDS)
     threadPool.shutdown()
+    actorSystem.shutdown()
     if (!isLocal) {
       env.stop()
     }
@@ -169,6 +179,9 @@ private[spark] class Executor(
      * from the driver. Once it is set, it will never be changed.
      */
     @volatile var task: Task[Any] = _
+
+    /** Inbox for comm with the stats aggregator actor System */
+    private val inbox = Inbox.create (actorSystem)
 
     def kill(interruptThread: Boolean): Unit = {
       logInfo(s"Executor is trying to kill $taskName (TID $taskId)")
@@ -207,10 +220,13 @@ private[spark] class Executor(
         logDebug("Task " + taskId + "'s epoch is " + task.epoch)
         env.mapOutputTracker.updateEpoch(task.epoch)
 
+        // do checkin
+        statsAggregator ! TaskCheckIn(task)
+
         // Run the actual task and measure its runtime.
         taskStart = System.currentTimeMillis()
         var threwException = true
-        val (value, accumUpdates) = try {
+        val (_value, accumUpdates) = try {
           val res = task.run(
             taskAttemptId = taskId,
             attemptNumber = attemptNumber,
@@ -233,6 +249,12 @@ private[spark] class Executor(
         // If the task has been killed, let's fail it.
         if (task.killed) {
           throw new TaskKilledException
+        }
+
+        // do checkout: it must be sent thought inbox because we expect return
+        inbox.send (statsAggregator, TaskCheckOut(task, _value))
+        val value = inbox.receive (timeout) match {
+          case CheckOutAck(value) => value
         }
 
         val resultSer = env.serializer.newInstance()

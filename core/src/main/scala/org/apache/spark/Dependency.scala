@@ -78,6 +78,25 @@ class ShuffleDependency[K: ClassTag, V: ClassTag, C: ClassTag](
 
   override def rdd: RDD[Product2[K, V]] = _rdd.asInstanceOf[RDD[Product2[K, V]]]
 
+  /** adaptive execution */
+  import com.tdunning.math.stats.TDigest
+  var updated = false
+  def update(tdigest: TDigest) = {
+    partitioner match {
+      case part: AdaptivePartitioner =>
+        part.setTDigest(tdigest)
+      case _ =>
+    }
+    _rdd.context.env.shuffleManager.unregisterShuffle (shuffleId)
+    shuffleId = _rdd.context.newShuffleId()
+    shuffleHandle = newShuffleHandle
+    updated = true
+  }
+
+  private def newShuffleHandle = _rdd.context.env.shuffleManager.registerShuffle(
+      shuffleId, _rdd.partitions.size, this)
+  /*****/
+
   private[spark] val keyClassName: String = reflect.classTag[K].runtimeClass.getName
   private[spark] val valueClassName: String = reflect.classTag[V].runtimeClass.getName
   // Note: It's possible that the combiner class tag is null, if the combineByKey
@@ -85,10 +104,9 @@ class ShuffleDependency[K: ClassTag, V: ClassTag, C: ClassTag](
   private[spark] val combinerClassName: Option[String] =
     Option(reflect.classTag[C]).map(_.runtimeClass.getName)
 
-  val shuffleId: Int = _rdd.context.newShuffleId()
+  var shuffleId: Int = _rdd.context.newShuffleId()
 
-  val shuffleHandle: ShuffleHandle = _rdd.context.env.shuffleManager.registerShuffle(
-    shuffleId, _rdd.partitions.size, this)
+  var shuffleHandle: ShuffleHandle = newShuffleHandle
 
   _rdd.sparkContext.cleaner.foreach(_.registerShuffleForCleanup(this))
 }

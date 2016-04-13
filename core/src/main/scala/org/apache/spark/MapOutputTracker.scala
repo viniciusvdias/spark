@@ -25,6 +25,7 @@ import java.util.zip.{GZIPInputStream, GZIPOutputStream}
 import scala.collection.JavaConverters._
 import scala.collection.mutable.{ArrayBuffer, HashMap, HashSet, Map}
 import scala.reflect.ClassTag
+import com.tdunning.math.stats.TDigest
 
 import org.apache.spark.rpc.{RpcEndpointRef, RpcEnv, RpcCallContext, RpcEndpoint}
 import org.apache.spark.scheduler.MapStatus
@@ -101,6 +102,10 @@ private[spark] abstract class MapOutputTracker(conf: SparkConf) extends Logging 
   /** Remembers which map output locations are currently being fetched on an executor. */
   private val fetching = new HashSet[Int]
 
+  /** tdigest instrumentation */
+  private val tdigestCompress = conf.getInt ("spark.optimizer.tdigest.compress", 100)
+
+
   /**
    * Send a message to the trackerEndpoint and get its result within a default timeout, or
    * throw a SparkException if this fails.
@@ -164,12 +169,19 @@ private[spark] abstract class MapOutputTracker(conf: SparkConf) extends Logging 
     // Synchronize on the returned array because, on the driver, it gets mutated in place
     statuses.synchronized {
       val totalSizes = new Array[Long](dep.partitioner.numPartitions)
+      val tdigest = TDigest.createAvlTreeDigest (tdigestCompress)
       for (s <- statuses) {
         for (i <- 0 until totalSizes.length) {
           totalSizes(i) += s.getSizeForBlock(i)
         }
+        s.getTDigest match {
+          case Some(td) =>
+            tdigest.add (td)
+            logWarning (s"[ShuffleId = ${dep.shuffleId}]: got tdigest from executor [size = ${tdigest.size}]")
+          case None =>
+        }
       }
-      new MapOutputStatistics(dep.shuffleId, totalSizes)
+      new MapOutputStatistics(dep.shuffleId, totalSizes, tdigest)
     }
   }
 

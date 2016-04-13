@@ -17,6 +17,8 @@
 
 package org.apache.spark
 
+import com.tdunning.math.stats.TDigest
+
 /**
  * Holds statistics about the output sizes in a map stage. May become a DeveloperApi in the future.
  *
@@ -24,4 +26,7 @@ package org.apache.spark
  * @param bytesByPartitionId approximate number of output bytes for each map output partition
  *   (may be inexact due to use of compressed map statuses)
  */
-private[spark] class MapOutputStatistics(val shuffleId: Int, val bytesByPartitionId: Array[Long])
+private[spark] class MapOutputStatistics(
+    val shuffleId: Int,
+    val bytesByPartitionId: Array[Long],
+    val tdigest: TDigest = null)

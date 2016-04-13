@@ -1394,10 +1394,32 @@ class DAGScheduler(
       stage.latestInfo.stageFailed(errorMessage.get)
       logInfo("%s (%s) failed in %s s".format(stage, stage.name, serviceTime))
     }
+    
+    /** stage just finished, so we will try to adapt future executions */
+    adaptDAGUpstream (stage.rdd)
 
     outputCommitCoordinator.stageEnd(stage.id)
     listenerBus.post(SparkListenerStageCompleted(stage.latestInfo))
     runningStages -= stage
+  }
+
+  /**
+   * Visits dependencies of an RDD upstream and adapt the execution according to
+   * collected statistics.
+   */
+  private def adaptDAGUpstream(rdd: RDD[_]): Unit = {
+    for (dep <- rdd.dependencies) dep match {
+      case shuffleDep: ShuffleDependency[_,_,_] =>
+        if (mapOutputTracker.containsShuffle(shuffleDep.shuffleId) && !shuffleDep.updated) {
+          val stats = mapOutputTracker.getStatistics(shuffleDep)
+          mapOutputTracker.unregisterShuffle (shuffleDep.shuffleId)
+          shuffleDep.update (stats.tdigest)
+          mapOutputTracker.registerShuffle(shuffleDep.shuffleId, rdd.partitions.length)
+          logWarning (s"Shuffle dependency updated: ${shuffleDep.partitioner}")
+        }
+      case _ =>
+        adaptDAGUpstream (dep.rdd)
+    }
   }
 
   /**

@@ -356,6 +356,19 @@
       <groupId>org.apache.spark</groupId>
       <artifactId>spark-test-tags_${scala.binary.version}</artifactId>
     </dependency>
+    <!-- new libs -->
+    <dependency>
+       <groupId>com.tdunning</groupId>
+       <artifactId>t-digest</artifactId>
+       <version>3.1</version>
+    </dependency>
+    <dependency>
+       <groupId>com.typesafe.akka</groupId>
+       <artifactId>akka-actor_${scala.binary.version}</artifactId>
+       <version>2.3.11</version>
+    </dependency>
+    <!-- new libs -->
+
   </dependencies>
   <build>
     <outputDirectory>target/scala-${scala.binary.version}/classes</outputDirectory>

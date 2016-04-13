@@ -31,6 +31,7 @@ import scala.collection.Iterator;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.io.Closeables;
+import com.tdunning.math.stats.TDigest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -90,6 +91,16 @@ final class BypassMergeSortShuffleWriter<K, V> extends ShuffleWriter<K, V> {
   private DiskBlockObjectWriter[] partitionWriters;
   @Nullable private MapStatus mapStatus;
   private long[] partitionLengths;
+  
+  /** tdigest instrumentation */
+  private TDigest tdigest;
+  private int costFunc(K k, V v) {
+     return 1;
+  }
+  private void insertInDigest(K k, V v) {
+    tdigest.add ((double)k.hashCode(), costFunc(k,v));
+  }
+  /*****/
 
   /**
    * Are we in the process of stopping? Because map tasks can call stop() with success = true
@@ -148,6 +159,7 @@ final class BypassMergeSortShuffleWriter<K, V> extends ShuffleWriter<K, V> {
     while (records.hasNext()) {
       final Product2<K, V> record = records.next();
       final K key = record._1();
+      insertInDigest (record._1(), record._2());
       partitionWriters[partitioner.getPartition(key)].write(key, record._2());
     }
 
@@ -159,7 +171,7 @@ final class BypassMergeSortShuffleWriter<K, V> extends ShuffleWriter<K, V> {
     File tmp = Utils.tempFileWith(output);
     partitionLengths = writePartitionedFile(tmp);
     shuffleBlockResolver.writeIndexFileAndCommit(shuffleId, mapId, partitionLengths, tmp);
-    mapStatus = MapStatus$.MODULE$.apply(blockManager.shuffleServerId(), partitionLengths);
+    mapStatus = MapStatus$.MODULE$.apply(blockManager.shuffleServerId(), partitionLengths, tdigest);
   }
 
   @VisibleForTesting
