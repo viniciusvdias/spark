@@ -31,6 +31,7 @@ import scala.collection.Map
 import scala.collection.mutable.ArrayBuffer
 import scala.io.Source
 import scala.reflect.ClassTag
+import scala.reflect.runtime.universe._
 import scala.util.Try
 import scala.util.control.{ControlThrowable, NonFatal}
 
@@ -2232,6 +2233,11 @@ private[spark] object Utils extends Logging {
   def tempFileWith(path: File): File = {
     new File(path.getAbsolutePath + "." + UUID.randomUUID())
   }
+
+  /**
+   * Get the type of a given object
+   */
+  def getTypeTag[T: TypeTag](ct: ClassTag[T]) = typeTag[T]
 }
 
 /**

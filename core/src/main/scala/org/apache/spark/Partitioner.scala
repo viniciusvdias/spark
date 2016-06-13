@@ -28,6 +28,11 @@ import org.apache.spark.rdd.{PartitionPruningRDD, RDD}
 import org.apache.spark.serializer.JavaSerializer
 import org.apache.spark.util.{CollectionsUtils, Utils}
 import org.apache.spark.util.random.{XORShiftRandom, SamplingUtils}
+import org.apache.spark.scheduler.StageMetrics
+
+import com.tdunning.math.stats.{TDigest, AVLTreeDigest}
+import java.nio.ByteBuffer
+import scala.collection.JavaConversions._
 
 /**
  * An object that defines how the elements in a key-value pair RDD are partitioned by key.
@@ -306,27 +311,55 @@ private[spark] object RangePartitioner {
   }
 }
 
-class AdaptivePartitioner(var numPartitions: Int,
-    var boundsOpt: Option[Array[Double]],
-    var centroidsOpt: Option[Array[(Double,Int)]],
-    var intervalsOpt: Option[Array[(Double,Double)]]) extends Partitioner {
+class AdaptivePartitioner(var _numPartitions: Int,
+    @transient var tdigestOpt: Option[TDigest],
+    @transient var stageMetricsOpt: Option[StageMetrics],
+    @transient var parentMetricsOpt: Option[Seq[StageMetrics]]) extends Partitioner {
 
-  import com.tdunning.math.stats.{TDigest, AVLTreeDigest}
-  import java.nio.ByteBuffer
-  import scala.collection.JavaConversions._
-  import scala.collection.immutable.Vector
-  import scala.collection.mutable.Map
-
-  val nVirtuals = 2
-
-  def this() = this(0, None, None, None)
   def this(numPartitions: Int) = this(numPartitions, None, None, None)
 
-  def getPartition(key: Any): Int = boundsOpt match {
-    //case Some(intervals) => getPartitionIntervals(key, intervals)
-    //case Some(centroids) => getPartitionCentroids(key, centroids)
-    case Some(bounds) => getPartitionBounds (key, bounds)
-    case None => getPartitionHash (key)
+  def numPartitions = _numPartitions
+
+  def adapt(stats: MapOutputStatistics, metrics: StageMetrics) = {
+    tdigestOpt = Some(stats.tdigest)
+    stageMetricsOpt = Some(metrics)
+  }
+
+  def adaptFromPartitioner(that: AdaptivePartitioner) = {
+    _numPartitions = that.numPartitions
+    tdigestOpt = that.tdigestOpt
+    stageMetricsOpt = that.stageMetricsOpt
+    parentMetricsOpt = that.parentMetricsOpt
+  }
+
+  def scale(_parentMetrics: Seq[StageMetrics]): Boolean = {
+    if (_parentMetrics.isEmpty)
+      return false
+
+    var updated = false
+    parentMetricsOpt match {
+      case Some(parentMetrics) => // scale
+        assert (_parentMetrics.size == parentMetrics.size)
+        val lastRecordsWritten = parentMetrics.map (_.recordsWritten).sum
+        val newRecordsWritten = _parentMetrics.map (_.recordsWritten).sum
+        val newNumPartitions = scala.math.ceil(numPartitions *
+          (newRecordsWritten / lastRecordsWritten.toDouble)).toInt
+        println (s"${this}: numPartitions=${numPartitions} :: newNumPartitions=${newNumPartitions}" +
+          s" :: lastRecordsWritten=${lastRecordsWritten} :: newRecordsWritten=${newRecordsWritten}")
+        if (numPartitions != newNumPartitions) {
+          _numPartitions = newNumPartitions
+          updated = true
+        }
+      case None => // do nothing
+    }
+
+    // new last parent metrics
+    parentMetricsOpt = Some (_parentMetrics)
+    updated
+  }
+
+  def getPartition(key: Any): Int = {
+    getPartitionHash (key)
   }
 
   private def getPartitionHash(key: Any): Int = key match {
@@ -334,201 +367,9 @@ class AdaptivePartitioner(var numPartitions: Int,
     case _ => Utils.nonNegativeMod(key.hashCode, numPartitions)
   }
 
-  private def getPartitionBounds(key: Any, bounds: Array[Double]): Int = {
-    for (i <- 0 until bounds.size) {
-      val k = key.hashCode
-      if (k <= bounds(i)) {
-        return i
-      }
-    }
-    return bounds.size - 1 
-  }
-  
-  private def getPartitionCentroids(key: Any, centroids: Array[(Double,Int)]): Int = {
-    val k = key.hashCode
-    for (i <- 0 until centroids.size) {
-      val (centroid,partId) = centroids(i)
-      if (k <= centroid) {
-        if (i > 0 && (k - centroids(i-1)._1) < (centroid - k)) {
-          return centroids(i-1)._2
-        } else {
-          return partId
-        }
-      }
-    }
-    return numPartitions - 1
-  }
-
-  def getPartitionIntervals(key: Any, intervals: Array[(Double,Double)]) = {
-    @scala.annotation.tailrec
-    def findPartition (intervals: Array[(Double,Double)], d: Int, from: Int, to: Int): Int = {
-      if (from == to) from
-      else {
-        val middle = (to + from) / 2
-        intervals(middle) match {
-          case (lower,_) if lower > d =>
-            findPartition (intervals, d, from, middle - 1)
-          case (_,upper) if upper < d =>
-            findPartition (intervals, d, middle + 1, to)
-          case _ => middle
-        }
-      }
-    }
-    findPartition (intervals, key.hashCode, 0, intervals.size - 1)
-  }
-
-  def setTDigest_(tdigest: TDigest) = {
-
-    println (s"tdigest size = ${tdigest.size}")
-
-    val centroidsMap = scala.collection.mutable.Map.empty[Double,Int].withDefaultValue(0)
-    tdigest.centroids.foreach (c => centroidsMap.update(c.mean, centroidsMap(c.mean) + c.count))
-    val totalWeight = centroidsMap.values.sum
-    val targetWeight = (totalWeight / numPartitions) max centroidsMap.values.max
-
-    val centroids = centroidsMap.toArray
-    println (s"targetWeight=${targetWeight})")
-    println (s"centroids(totalWeight=${totalWeight}) \n ${centroids.mkString("\n")}")
-
-    val centroidGroups = Map.empty[Int, (Vector[Double], Int)]
-    for ((m,c) <- centroids.iterator) {
-      var part = -1
-      val ccIter = centroidGroups.iterator
-      while (ccIter.hasNext && part == -1) {
-        val (i, (centroids, weight)) = ccIter.next
-        if (weight + c <= targetWeight)
-          part = i
-      }
-      centroidGroups.get(part) match {
-        case Some(ccGroup) =>
-          centroidGroups.update (part, (ccGroup._1 :+ m, ccGroup._2 + c))
-        case None =>
-          centroidGroups.update (centroidGroups.size, (Vector(m), c))
-      }
-    }
-    
-
-    centroidsOpt = Some(
-      centroidGroups.flatMap {case (part, (centroids, _)) => centroids.iterator zip Iterator.continually(part)}.toArray.sortBy(_._1)
-    )
-    
-    println (s"centroids \n ${centroidsOpt.get.mkString("\n")}")
-
-    numPartitions = centroidGroups.size
-  }
-
-  def setTDigest(tdigest: TDigest) = {
-    println (s"tdigest size = ${tdigest.size}; total = ${tdigest.centroids.map(_.count).sum}; bytes = ${tdigest.byteSize}")
-    //val centroidsMap = scala.collection.mutable.Map.empty[Double,Int].withDefaultValue(0)
-    //tdigest.centroids.foreach (c => centroidsMap.update(c.mean, centroidsMap(c.mean) + c.count))
-    def evaluateBounds(step: Double): Array[Double] = {
-
-      var quantiles = (step to 1d by step).toArray
-      quantiles(quantiles.size - 1) = 1d
-
-      val bounds = quantiles.map (q => tdigest.quantile (q))
-
-      val quantilesAndBounds = (quantiles zip bounds).zipWithIndex
-
-      println (s"quantiles and bounds \n${quantilesAndBounds.mkString("\n")}")
-
-      if (bounds.toSet.size == bounds.size) {
-        bounds.toArray
-      } else {
-        var maxContiguous = Int.MinValue
-        var currContiguous = 1
-        for (i <- 1 until bounds.size) {
-          if (bounds(i) == bounds(i-1)) {
-            currContiguous += 1
-            if (currContiguous > maxContiguous) {
-              maxContiguous = currContiguous
-            }
-          } else {
-            currContiguous = 1
-          }
-        }
-        bounds.toArray
-        evaluateBounds (step * maxContiguous)
-      }
-    }
-    val step = 1d / numPartitions
-    val bounds = evaluateBounds(step)
-    //var quantiles = (step to 1d by step).toArray
-    //quantiles(quantiles.size - 1) = 1d
-    //val bounds = quantiles.map (q => tdigest.quantile (q))
-    println (s"bounds \n ${bounds.mkString("\n")}")
-    numPartitions = bounds.size
-    boundsOpt = Some(bounds)
-  }
-
-  def setTDigest__(tdigest: TDigest) = {
-    val step = 1d / numPartitions
-    val thresholds = (0d to 1d by step).toArray
-
-    val intervals = getIntervals (tdigest, thresholds)
-    val bounds = intervals.
-      map (d => (tdigest.quantile(d._1), tdigest.quantile(d._2))).
-      unzip._2
-
-    //intervalsOpt = Some(intervals)
-    boundsOpt = Some(bounds.toArray)
-    numPartitions = intervals.size
-  }
-
-  private def getIntervals(digest: TDigest, thresholds: Array[Double]): Array[(Double,Double)] = {
-    def makeIntervs(thresholds: Array[Double]) = {
-      val intervs = (thresholds.dropRight(1) zip thresholds.drop(1))
-      intervs
-    }
-
-    if (thresholds.size <= 1) return Array.empty
-    else if (thresholds.size == 2) return Array((thresholds(0),thresholds(1)))
-
-    val (lower, upper) = (thresholds(0), thresholds(thresholds.size - 1))
-
-    val bounds = thresholds.map (d => digest.quantile(d))
-    val newThresholds = bounds.map (n => digest.cdf(n)).toSet.toArray.sorted
-    if (newThresholds.size == thresholds.size)
-      return makeIntervs (thresholds)
-
-    newThresholds(0) = lower
-    newThresholds(newThresholds.size - 1) = upper
-
-    if (newThresholds.size == 1) return Array.empty
-
-    val intervs = makeIntervs (newThresholds)
-
-    val largerInterv = intervs.maxBy (interv => interv._2 - interv._1)
-
-    val newStep = largerInterv._2 - largerInterv._1
-
-    def split(lower: Double, upper: Double, step: Double): Array[(Double,Double)] = {
-      val n = scala.math.ceil(((upper - lower) / step)).toInt
-      val newStep = (upper - lower) / n
-      val thresholds = (lower to upper by newStep).toArray
-      thresholds(0) = lower
-      thresholds(thresholds.size - 1) = upper
-      getIntervals (digest, thresholds)
-    }
-
-    val splitLeftIntervs = split (lower, largerInterv._1, newStep)
-    val splitRightIntervs = split (largerInterv._2, upper, newStep)
-
-    val finalIntervs = splitLeftIntervs ++ List(largerInterv) ++ splitRightIntervs
-
-    finalIntervs
-  }
-
-
-  override def equals(other: Any): Boolean = other match {
-    case h: AdaptivePartitioner =>
-      h.numPartitions == numPartitions
-    case _ =>
-      false
-  }
-
   override def hashCode: Int = numPartitions
 
-  override def toString = s"AdaptivePartitioner(${numPartitions}, ${boundsOpt})"
+  override def toString =
+    s"AdaptivePartitioner(${numPartitions}, ${tdigestOpt}, ${stageMetricsOpt})"
 
 }

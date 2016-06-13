@@ -94,11 +94,13 @@ final class BypassMergeSortShuffleWriter<K, V> extends ShuffleWriter<K, V> {
   
   /** tdigest instrumentation */
   private TDigest tdigest;
+  private boolean shouldInstrument;
   private int costFunc(K k, V v) {
      return 1;
   }
   private void insertInDigest(K k, V v) {
-    tdigest.add ((double)k.hashCode(), costFunc(k,v));
+    if (shouldInstrument)
+       tdigest.add ((double)k.hashCode(), costFunc(k,v));
   }
   /*****/
 
@@ -129,6 +131,11 @@ final class BypassMergeSortShuffleWriter<K, V> extends ShuffleWriter<K, V> {
     taskContext.taskMetrics().shuffleWriteMetrics_$eq(Option.apply(writeMetrics));
     this.serializer = Serializer.getSerializer(dep.serializer());
     this.shuffleBlockResolver = shuffleBlockResolver;
+    this.shouldInstrument = dep.shouldInstrument();
+    if (this.shouldInstrument) {
+       int tdigestCompress = conf.getInt ("spark.optimizer.tdigest.compress", 100);
+       tdigest = TDigest.createAvlTreeDigest (tdigestCompress);
+    }
   }
 
   @Override

@@ -18,15 +18,18 @@
 package org.apache.spark.rdd
 
 import scala.reflect.ClassTag
+import scala.reflect.runtime.universe._
 
 import org.apache.spark.{Partition, TaskContext}
+
+import org.apache.spark.util.Utils
 
 /**
  * An RDD that applies the provided function to every partition of the parent RDD.
  */
 private[spark] class MapPartitionsRDD[U: ClassTag, T: ClassTag](
     var prev: RDD[T],
-    f: (TaskContext, Int, Iterator[T]) => Iterator[U],  // (TaskContext, partition index, iterator)
+    val f: (TaskContext, Int, Iterator[T]) => Iterator[U],  // (TaskContext, partition index, iterator)
     preservesPartitioning: Boolean = false)
   extends RDD[U](prev) {
 
@@ -40,5 +43,11 @@ private[spark] class MapPartitionsRDD[U: ClassTag, T: ClassTag](
   override def clearDependencies() {
     super.clearDependencies()
     prev = null
+  }
+
+  override def equiv(_that: Any): Boolean = _that match {
+    case that: MapPartitionsRDD[_,_] =>
+      super.equiv (that)
+    case _ => false
   }
 }

@@ -141,6 +141,29 @@ class DAGScheduler(
   private[scheduler] val shuffleToMapStage = new HashMap[Int, ShuffleMapStage]
   private[scheduler] val jobIdToActiveJob = new HashMap[Int, ActiveJob]
 
+  /** adaptive execution */
+
+  private[scheduler] val callSiteToAdaptedShuffleDep =
+    new HashMap[(String,String), ShuffleDependency[_,_,_]]
+
+  private def registerShuffleDep(dep: ShuffleDependency[_,_,_]) =
+    callSiteToAdaptedShuffleDep.update (
+      (dep.rdd.creationSite.shortForm, dep.depOwner.creationSite.shortForm),
+      dep
+      )
+
+  private def equivShuffleDep(dep: ShuffleDependency[_,_,_]) =
+    callSiteToAdaptedShuffleDep.get (
+      (dep.rdd.creationSite.shortForm, dep.depOwner.creationSite.shortForm)
+      )
+
+  private[scheduler] val stagesMetrics = {
+    val stagesMetrics = new StagesMetrics
+    sc.addSparkListener (stagesMetrics)
+    stagesMetrics
+  }
+  /****/
+
   // Stages we need to run whose parents aren't done
   private[scheduler] val waitingStages = new HashSet[Stage]
 
@@ -283,7 +306,8 @@ class DAGScheduler(
       case None =>
         // We are going to register ancestor shuffle dependencies
         getAncestorShuffleDependencies(shuffleDep.rdd).foreach { dep =>
-          shuffleToMapStage(dep.shuffleId) = newOrUsedShuffleStage(dep, firstJobId)
+          val stage = newOrUsedShuffleStage(dep, firstJobId)
+          shuffleToMapStage(dep.shuffleId) = stage
         }
         // Then register current shuffleDep
         val stage = newOrUsedShuffleStage(shuffleDep, firstJobId)
@@ -348,8 +372,25 @@ class DAGScheduler(
       shuffleDep: ShuffleDependency[_, _, _],
       firstJobId: Int): ShuffleMapStage = {
     val rdd = shuffleDep.rdd
+
     val numTasks = rdd.partitions.length
     val stage = newShuffleMapStage(rdd, numTasks, shuffleDep, firstJobId, rdd.creationSite)
+
+    /** adaptive execution */
+    if(shuffleDep.shouldInstrument) equivShuffleDep (shuffleDep) match {
+      case Some(eqShuffleDep) =>
+        // update rdd dependency based on the equivalent
+        val oldShuffleIdOpt = shuffleDep.adaptFromShuffleDep (eqShuffleDep)
+        registerShuffleDep (shuffleDep)
+        //val oldStage = shuffleToMapStage.remove (eqShuffleDep.shuffleId).get
+
+        logWarning (s"${shuffleDep.shuffleId} adapted from ${eqShuffleDep.shuffleId}")
+
+      case None =>
+        // no similar stage to adapt for
+    }
+    /******/
+
     if (mapOutputTracker.containsShuffle(shuffleDep.shuffleId)) {
       val serLocs = mapOutputTracker.getSerializedMapOutputStatuses(shuffleDep.shuffleId)
       val locs = MapOutputTracker.deserializeMapStatuses(serLocs)
@@ -364,6 +405,7 @@ class DAGScheduler(
       // since we can't do it in the RDD constructor because # of partitions is unknown
       logInfo("Registering RDD " + rdd.id + " (" + rdd.getCreationSite + ")")
       mapOutputTracker.registerShuffle(shuffleDep.shuffleId, rdd.partitions.length)
+      stagesMetrics.trackStage (stage)
     }
     stage
   }
@@ -932,7 +974,25 @@ class DAGScheduler(
   }
 
   /** Called when stage's parents are available and we can now do its task. */
-  private def submitMissingTasks(stage: Stage, jobId: Int) {
+  private def submitMissingTasks(_stage: Stage, jobId: Int) {
+    val stage: Stage = _stage match {
+      case s: ShuffleMapStage =>
+        val equivs = s.parents.map (parent => stagesMetrics.lastEquiv(parent))
+        logWarning (s"last equivs: ${equivs.mkString ("; ")}")
+        val oldShuffleIdOpt = s.shuffleDep.scale (equivs)
+        if (oldShuffleIdOpt.isDefined) {
+          val oldShuffleId = oldShuffleIdOpt.get
+          mapOutputTracker.unregisterShuffle (oldShuffleId)
+          val newStage = getShuffleMapStage(s.shuffleDep, jobId)
+          logWarning (s"oldStage=${s},${s.numTasks}; newStage=${newStage},${newStage.numTasks}")
+          newStage
+        } else {
+          s
+        }
+      case s => s
+    }
+
+    logWarning("submitMissingTasks(" + stage + ")")
     logDebug("submitMissingTasks(" + stage + ")")
     // Get our pending tasks and remember them in our pendingTasks entry
     stage.pendingPartitions.clear()
@@ -1395,27 +1455,49 @@ class DAGScheduler(
       logInfo("%s (%s) failed in %s s".format(stage, stage.name, serviceTime))
     }
     
-    /** stage just finished, so we will try to adapt future executions */
-    adaptDAGUpstream (stage.rdd)
-
     outputCommitCoordinator.stageEnd(stage.id)
     listenerBus.post(SparkListenerStageCompleted(stage.latestInfo))
     runningStages -= stage
+    
+    /** stage just finished, so we will try to adapt future executions */
+    adaptDAGUpstream (stage.rdd)
   }
 
   /**
-   * Visits dependencies of an RDD upstream and adapt the execution according to
-   * collected statistics.
+   * Visits the DAG upstream and search for the first level of shuffle
+   * dependencies. When such level is reached (may not happen) the shuffle
+   * dependencies are adapted according to observed statistics.
+   *
+   * Observed statistics: mapOutputStatistics and stageMetrics
    */
   private def adaptDAGUpstream(rdd: RDD[_]): Unit = {
     for (dep <- rdd.dependencies) dep match {
       case shuffleDep: ShuffleDependency[_,_,_] =>
-        if (mapOutputTracker.containsShuffle(shuffleDep.shuffleId) && !shuffleDep.updated) {
+        if (mapOutputTracker.containsShuffle(shuffleDep.shuffleId) && shuffleDep.shouldInstrument) {
+
+          // collect infos
+          val oldShuffleId = shuffleDep.shuffleId
           val stats = mapOutputTracker.getStatistics(shuffleDep)
-          mapOutputTracker.unregisterShuffle (shuffleDep.shuffleId)
-          shuffleDep.update (stats.tdigest)
-          mapOutputTracker.registerShuffle(shuffleDep.shuffleId, rdd.partitions.length)
-          logWarning (s"Shuffle dependency updated: ${shuffleDep.partitioner}")
+          val stage = shuffleToMapStage(oldShuffleId)
+          val sm = stagesMetrics.get(stage.id)
+          
+          // adapt, i.e., causing shuffleDep mutation
+          shuffleDep.adapt (stats, sm)
+          
+          // unregister old shuffleId
+          mapOutputTracker.unregisterShuffle (oldShuffleId)
+
+          // fiz new shuffleId in mapping (opt must exists)
+          val stageOpt = shuffleToMapStage.remove(oldShuffleId)
+          assert (stage == stageOpt.get) // sanity check
+          // new shuffleId
+          shuffleToMapStage.update (shuffleDep.shuffleId, stageOpt.get)
+
+          // register new shuffleId and set creation site
+          //mapOutputTracker.registerShuffle(shuffleDep.shuffleId, rdd.partitions.length)
+          registerShuffleDep (shuffleDep)
+
+          logWarning (s"${shuffleDep} adapted from ${stats} and ${sm}")
         }
       case _ =>
         adaptDAGUpstream (dep.rdd)
@@ -1602,6 +1684,8 @@ class DAGScheduler(
     messageScheduler.shutdownNow()
     eventProcessLoop.stop()
     taskScheduler.stop()
+    logWarning (s"Tracked stages: ${stagesMetrics.numTrackedStages} [bytes=${SizeEstimator.estimate(stagesMetrics)}]")
+    logWarning (s"Tracked stages: ${stagesMetrics.trackedStages.mkString(" ")}")
   }
 
   eventProcessLoop.start()

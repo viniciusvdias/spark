@@ -24,6 +24,8 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.serializer.Serializer
 import org.apache.spark.shuffle.ShuffleHandle
 
+import org.apache.spark.scheduler.StageMetrics
+
 /**
  * :: DeveloperApi ::
  * Base class for dependencies.
@@ -31,6 +33,11 @@ import org.apache.spark.shuffle.ShuffleHandle
 @DeveloperApi
 abstract class Dependency[T] extends Serializable {
   def rdd: RDD[T]
+  def equiv(_that: Any): Boolean = _that match {
+    case that: Dependency[_] =>
+      this.rdd.equiv (that.rdd)
+    case _ => false
+  }
 }
 
 
@@ -73,28 +80,67 @@ class ShuffleDependency[K: ClassTag, V: ClassTag, C: ClassTag](
     val serializer: Option[Serializer] = None,
     val keyOrdering: Option[Ordering[K]] = None,
     val aggregator: Option[Aggregator[K, V, C]] = None,
-    val mapSideCombine: Boolean = false)
+    val mapSideCombine: Boolean = false,
+    val depOwnerOpt: Option[RDD[_]] = None)
   extends Dependency[Product2[K, V]] {
 
   override def rdd: RDD[Product2[K, V]] = _rdd.asInstanceOf[RDD[Product2[K, V]]]
 
   /** adaptive execution */
-  import com.tdunning.math.stats.TDigest
-  var updated = false
-  def update(tdigest: TDigest) = {
-    partitioner match {
-      case part: AdaptivePartitioner =>
-        part.setTDigest(tdigest)
-      case _ =>
-    }
-    _rdd.context.env.shuffleManager.unregisterShuffle (shuffleId)
-    shuffleId = _rdd.context.newShuffleId()
-    shuffleHandle = newShuffleHandle
-    updated = true
+  def depOwner = depOwnerOpt.get
+
+  var _updated = false
+
+  def updated: Boolean = _updated
+
+  def shouldInstrument: Boolean =
+    partitioner.isInstanceOf[AdaptivePartitioner] && !updated
+
+  def adapt(stats: MapOutputStatistics, metrics: StageMetrics): Option[Int] = partitioner match {
+    case thisPartitioner: AdaptivePartitioner =>
+      thisPartitioner.adapt (stats, metrics)
+      _rdd.context.env.shuffleManager.unregisterShuffle (shuffleId)
+      val oldShuffleId = shuffleId
+      shuffleId = _rdd.context.newShuffleId()
+      shuffleHandle = newShuffleHandle
+      _updated = true
+      Some(oldShuffleId)
+    case _ =>
+      None
   }
 
-  private def newShuffleHandle = _rdd.context.env.shuffleManager.registerShuffle(
-      shuffleId, _rdd.partitions.size, this)
+  def adaptFromShuffleDep(other: ShuffleDependency[_,_,_]): Option[Int] = (partitioner, other.partitioner) match {
+    case (thisPartitioner: AdaptivePartitioner, thatPartitioner: AdaptivePartitioner) =>
+      thisPartitioner.adaptFromPartitioner (thatPartitioner)
+      _rdd.context.env.shuffleManager.unregisterShuffle (shuffleId)
+      val oldShuffleId = shuffleId
+      shuffleId = _rdd.context.newShuffleId()
+      shuffleHandle = newShuffleHandle
+      _updated = true
+      Some(oldShuffleId)
+    case _ =>
+      None
+  }
+
+  def scale(parentMetrics: Seq[StageMetrics]): Option[Int] = partitioner match {
+    case thisPartitioner: AdaptivePartitioner =>
+      val updated = thisPartitioner.scale (parentMetrics)
+      if (updated) {
+        val oldShuffleId = shuffleId
+        shuffleId = _rdd.context.newShuffleId()
+        shuffleHandle = newShuffleHandle
+        Some(oldShuffleId)
+      } else {
+        None
+      }
+    case _ =>
+      None
+  }
+
+  private def newShuffleHandle = {
+    _rdd.context.env.shuffleManager.
+      registerShuffle(shuffleId, _rdd.partitions.size, this)
+  }
   /*****/
 
   private[spark] val keyClassName: String = reflect.classTag[K].runtimeClass.getName
@@ -109,6 +155,11 @@ class ShuffleDependency[K: ClassTag, V: ClassTag, C: ClassTag](
   var shuffleHandle: ShuffleHandle = newShuffleHandle
 
   _rdd.sparkContext.cleaner.foreach(_.registerShuffleForCleanup(this))
+
+  override def toString = {
+    s"ShuffleDep(shuffleId=${shuffleId}, rdd=${rdd}, partitioner=${partitioner}, updated=${updated})"
+  }
+
 }
 
 

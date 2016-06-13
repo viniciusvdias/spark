@@ -85,15 +85,19 @@ class StatsAggregator extends Actor with Logging {
     runningPerStage.get(shuffleMapTask.stageId) match {
       
       case Some ( (runningTasks, _tdigest) ) if runningTasks == 1 => // last task, piggybacking
-        val tdigest = mapStatus.getTDigest.get
-        tdigest.add (_tdigest)
-        aggregated += 1
+        if (mapStatus.getTDigest.isDefined) {
+          val tdigest = mapStatus.getTDigest.get
+          tdigest.add (_tdigest)
+          aggregated += 1
+        }
         runningPerStage.remove (shuffleMapTask.stageId)
         
       case Some ( (runningTasks, tdigest) ) => // just do aggregation, unset mapStatus
-        tdigest.add (mapStatus.getTDigest.get)
-        mapStatus.unsetTDigest
-        aggregated += 1
+        if (mapStatus.getTDigest.isDefined) {
+          tdigest.add (mapStatus.getTDigest.get)
+          mapStatus.unsetTDigest
+          aggregated += 1
+        }
         runningPerStage.update (shuffleMapTask.stageId, (runningTasks - 1, tdigest) )
 
       case _ =>

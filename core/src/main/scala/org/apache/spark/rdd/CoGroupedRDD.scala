@@ -103,7 +103,7 @@ class CoGroupedRDD[K: ClassTag](
       } else {
         logDebug("Adding shuffle dependency with " + rdd)
         new ShuffleDependency[K, Any, CoGroupCombiner](
-          rdd.asInstanceOf[RDD[_ <: Product2[K, _]]], part, serializer)
+          rdd.asInstanceOf[RDD[_ <: Product2[K, _]]], part, serializer, depOwnerOpt = Some(this))
       }
     }
   }

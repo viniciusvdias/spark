@@ -24,6 +24,7 @@ import scala.collection.Map
 import scala.collection.immutable.NumericRange
 import scala.collection.mutable.ArrayBuffer
 import scala.reflect.ClassTag
+import scala.reflect.runtime.universe.TypeTag
 
 import org.apache.spark._
 import org.apache.spark.serializer.JavaSerializer
@@ -104,6 +105,12 @@ private[spark] class ParallelCollectionRDD[T: ClassTag](
 
   override def getPreferredLocations(s: Partition): Seq[String] = {
     locationPrefs.getOrElse(s.index, Nil)
+  }
+
+  override def equiv(_that: Any): Boolean = _that match {
+    case that: ParallelCollectionRDD[_] =>
+      this.data == that.data
+    case _ => false
   }
 }
 

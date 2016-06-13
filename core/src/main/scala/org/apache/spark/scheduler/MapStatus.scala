@@ -146,7 +146,7 @@ private[spark] class CompressedMapStatus(
   }
 
   def this(loc: BlockManagerId, uncompressedSizes: Array[Long], tdigest: TDigest) {
-    this(loc, uncompressedSizes.map(MapStatus.compressSize), Some(tdigest))
+    this(loc, uncompressedSizes.map(MapStatus.compressSize), Option(tdigest))
   }
 
   override def location: BlockManagerId = loc
@@ -211,7 +211,7 @@ private[spark] class HighlyCompressedMapStatus private (
     numNonEmptyBlocks: Int,
     emptyBlocks: RoaringBitmap,
     avgSize: Long,
-    tdigest: TDigest) = this (loc, numNonEmptyBlocks, emptyBlocks, avgSize, Some(tdigest))
+    tdigest: TDigest) = this (loc, numNonEmptyBlocks, emptyBlocks, avgSize, Option(tdigest))
 
   override def location: BlockManagerId = loc
 

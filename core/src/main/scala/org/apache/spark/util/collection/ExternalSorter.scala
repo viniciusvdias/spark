@@ -92,7 +92,8 @@ private[spark] class ExternalSorter[K, V, C](
     aggregator: Option[Aggregator[K, V, C]] = None,
     partitioner: Option[Partitioner] = None,
     ordering: Option[Ordering[K]] = None,
-    serializer: Option[Serializer] = None)
+    serializer: Option[Serializer] = None,
+    shouldInstrument: Boolean = false)
   extends Logging
   with Spillable[WritablePartitionedPairCollection[K, C]] {
 
@@ -101,10 +102,12 @@ private[spark] class ExternalSorter[K, V, C](
   private val conf = SparkEnv.get.conf
 
   /* tdigest instrumentation */ 
-  val tdigestCompress = conf.getInt ("spark.optimizer.tdigest.compress", 100)
-  val tdigest: TDigest = TDigest.createAvlTreeDigest (tdigestCompress)
+  val tdigest: TDigest = if (shouldInstrument) {
+    val tdigestCompress = conf.getInt ("spark.optimizer.tdigest.compress", 100)
+    TDigest.createAvlTreeDigest (tdigestCompress)
+  } else null
   private def costFunc(k: Any, v: Any) = 1
-  private def insertInDigest(k: Any, v: Any) = {
+  private def insertInDigest(k: Any, v: Any) = if (shouldInstrument) {
     tdigest.add (k.hashCode.toDouble, costFunc(k,v))
   }
   /****/

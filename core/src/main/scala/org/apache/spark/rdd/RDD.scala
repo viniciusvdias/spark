@@ -23,6 +23,7 @@ import scala.collection.{mutable, Map}
 import scala.collection.mutable.ArrayBuffer
 import scala.language.implicitConversions
 import scala.reflect.{classTag, ClassTag}
+import scala.reflect.runtime.universe.{typeTag, TypeTag}
 
 import com.clearspring.analytics.stream.cardinality.HyperLogLogPlus
 import org.apache.hadoop.io.{BytesWritable, NullWritable, Text}
@@ -129,6 +130,16 @@ abstract class RDD[T: ClassTag](
   /** Optionally overridden by subclasses to specify how they are partitioned. */
   @transient val partitioner: Option[Partitioner] = None
 
+  def equiv(_that: Any): Boolean = _that match {
+    case that: RDD[_] =>
+      if (dependencies.size != that.dependencies.size)
+        return false
+      for (i <- 0 until dependencies.size)
+        if (!(dependencies(i) equiv that.dependencies(i)))
+          return false
+      return true
+    case _ => false
+  }
   // =======================================================================
   // Methods and fields available on all RDDs
   // =======================================================================
@@ -1635,7 +1646,7 @@ abstract class RDD[T: ClassTag](
   private[spark] def getCreationSite: String = Option(creationSite).map(_.shortForm).getOrElse("")
 
   private[spark] def elementClassTag: ClassTag[T] = classTag[T]
-
+ 
   private[spark] var checkpointData: Option[RDDCheckpointData[T]] = None
 
   /** Returns the first parent RDD */

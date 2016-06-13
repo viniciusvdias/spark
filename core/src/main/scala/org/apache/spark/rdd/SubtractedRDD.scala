@@ -70,7 +70,7 @@ private[spark] class SubtractedRDD[K: ClassTag, V: ClassTag, W: ClassTag](
         new OneToOneDependency(rdd)
       } else {
         logDebug("Adding shuffle dependency with " + rdd)
-        new ShuffleDependency[T1, T2, Any](rdd, part, serializer)
+        new ShuffleDependency[T1, T2, Any](rdd, part, serializer, depOwnerOpt = Some(this))
       }
     }
     Seq(rddDependency[K, V](rdd1), rddDependency[K, W](rdd2))
