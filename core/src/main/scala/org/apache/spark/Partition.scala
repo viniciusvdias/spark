@@ -26,6 +26,11 @@ trait Partition extends Serializable {
    */
   def index: Int
 
+  @transient val partitioner: Option[Partitioner] = None
+
+  final def startIdx: Int = partitioner.map(part => part.startIdx(index)).getOrElse(index)
+  final def endIdx: Int = partitioner.map(part => part.endIdx(index)).getOrElse(index + 1)
+
   // A better default implementation of HashCode
   override def hashCode(): Int = index
 }

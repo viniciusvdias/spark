@@ -57,9 +57,10 @@ private[spark] case class NarrowCoGroupSplitDep(
  *                   narrowDeps should always be equal to the number of parents.
  */
 private[spark] class CoGroupPartition(
-    idx: Int, val narrowDeps: Array[Option[NarrowCoGroupSplitDep]])
+    idx: Int, val narrowDeps: Array[Option[NarrowCoGroupSplitDep]], part: Partitioner)
   extends Partition with Serializable {
   override val index: Int = idx
+  override val partitioner: Option[Partitioner] = Some(part)
   override def hashCode(): Int = idx
 }
 
@@ -109,7 +110,7 @@ class CoGroupedRDD[K: ClassTag](
   }
 
   override def getPartitions: Array[Partition] = {
-    val array = new Array[Partition](part.numPartitions)
+    val array = new Array[Partition](partitioner.get.numPartitions)
     for (i <- 0 until array.length) {
       // Each CoGroupPartition will have a dependency per contributing RDD
       array(i) = new CoGroupPartition(i, rdds.zipWithIndex.map { case (rdd, j) =>
@@ -120,12 +121,12 @@ class CoGroupedRDD[K: ClassTag](
           case _ =>
             Some(new NarrowCoGroupSplitDep(rdd, i, rdd.partitions(i)))
         }
-      }.toArray)
+      }.toArray, partitioner.get)
     }
     array
   }
 
-  override val partitioner: Some[Partitioner] = Some(part)
+  setPartitioner(Some(part))
 
   override def compute(s: Partition, context: TaskContext): Iterator[(K, Array[Iterable[_]])] = {
     val split = s.asInstanceOf[CoGroupPartition]
@@ -143,7 +144,7 @@ class CoGroupedRDD[K: ClassTag](
       case shuffleDependency: ShuffleDependency[_, _, _] =>
         // Read map outputs of shuffle
         val it = SparkEnv.get.shuffleManager
-          .getReader(shuffleDependency.shuffleHandle, split.index, split.index + 1, context)
+          .getReader(shuffleDependency.shuffleHandle, split.startIdx, split.endIdx, context)
           .read()
         rddIterators += ((it, depNum))
     }

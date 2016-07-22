@@ -36,7 +36,7 @@ class VertexRDDImpl[VD] private[graphx] (
 
   override def reindex(): VertexRDD[VD] = this.withPartitionsRDD(partitionsRDD.map(_.reindex()))
 
-  override val partitioner = partitionsRDD.partitioner
+  setPartitioner(partitionsRDD.partitioner)
 
   override protected def getPreferredLocations(s: Partition): Seq[String] =
     partitionsRDD.preferredLocations(s)

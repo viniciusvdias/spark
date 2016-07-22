@@ -50,11 +50,9 @@ private[spark] class ReliableCheckpointRDD[T: ClassTag](
    */
   override val getCheckpointFile: Option[String] = Some(checkpointPath)
 
-  override val partitioner: Option[Partitioner] = {
-    _partitioner.orElse {
-      ReliableCheckpointRDD.readCheckpointedPartitionerFile(context, checkpointPath)
-    }
-  }
+  setPartitioner (_partitioner.orElse {
+    ReliableCheckpointRDD.readCheckpointedPartitionerFile(context, checkpointPath)
+  })
 
   /**
    * Return partitions described by the files in the checkpoint directory.

@@ -135,7 +135,7 @@ private[streaming] class MapWithStateRDD[K: ClassTag, V: ClassTag, S: ClassTag, 
   require(prevStateRDD.partitioner.nonEmpty)
   require(partitionedDataRDD.partitioner == prevStateRDD.partitioner)
 
-  override val partitioner = prevStateRDD.partitioner
+  setPartitioner(prevStateRDD.partitioner)
 
   override def checkpoint(): Unit = {
     super.checkpoint()

@@ -77,7 +77,7 @@ private[spark] class SubtractedRDD[K: ClassTag, V: ClassTag, W: ClassTag](
   }
 
   override def getPartitions: Array[Partition] = {
-    val array = new Array[Partition](part.numPartitions)
+    val array = new Array[Partition](partitioner.get.numPartitions)
     for (i <- 0 until array.length) {
       // Each CoGroupPartition will depend on rdd1 and rdd2
       array(i) = new CoGroupPartition(i, Seq(rdd1, rdd2).zipWithIndex.map { case (rdd, j) =>
@@ -87,12 +87,12 @@ private[spark] class SubtractedRDD[K: ClassTag, V: ClassTag, W: ClassTag](
           case _ =>
             Some(new NarrowCoGroupSplitDep(rdd, i, rdd.partitions(i)))
         }
-      }.toArray)
+      }.toArray, partitioner.get)
     }
     array
   }
 
-  override val partitioner = Some(part)
+  setPartitioner(Some(part))
 
   override def compute(p: Partition, context: TaskContext): Iterator[(K, V)] = {
     val partition = p.asInstanceOf[CoGroupPartition]

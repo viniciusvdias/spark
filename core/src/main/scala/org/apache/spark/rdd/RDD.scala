@@ -3,7 +3,7 @@
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
  * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
+* (the "License"); you may not use this file except in compliance with
  * the License.  You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
@@ -127,7 +127,9 @@ abstract class RDD[T: ClassTag](
   protected def getPreferredLocations(split: Partition): Seq[String] = Nil
 
   /** Optionally overridden by subclasses to specify how they are partitioned. */
-  @transient val partitioner: Option[Partitioner] = None
+  @transient private[spark] var partitioner: Option[Partitioner] = None
+
+  
 
   // =======================================================================
   // Methods and fields available on all RDDs
@@ -212,6 +214,33 @@ abstract class RDD[T: ClassTag](
   // be overwritten when we're checkpointed
   private var dependencies_ : Seq[Dependency[_]] = null
   @transient private var partitions_ : Array[Partition] = null
+  
+  @transient private var partitionsDirty: Boolean = false
+
+  /**
+   * Indicates that the partitions must be re-computed because, for instance,
+   * the partitioner has changed.
+   */
+  private def setPartitionsDirty: Unit = {
+    partitionsDirty = true
+  }
+
+  /**
+   * Called right after re-computing the new set of partitions
+   */
+  private def unsetPartitionsDirty: Unit = {
+    partitionsDirty = false
+  }
+
+  /**
+   * Set the partitioner for this RDD
+   */
+  private[spark] def setPartitioner(partOpt: Option[Partitioner]): Unit = {
+    partitioner = partOpt
+    setPartitionsDirty
+  }
+
+  private[spark] def setPartitioner(part: Partitioner): Unit = setPartitioner(Option(part))
 
   /** An Option holding our checkpoint RDD, if we are checkpointed */
   private def checkpointRDD: Option[CheckpointRDD[T]] = checkpointData.flatMap(_.checkpointRDD)
@@ -235,8 +264,9 @@ abstract class RDD[T: ClassTag](
    */
   final def partitions: Array[Partition] = {
     checkpointRDD.map(_.partitions).getOrElse {
-      if (partitions_ == null) {
+      if (partitions_ == null || partitionsDirty) {
         partitions_ = getPartitions
+        unsetPartitionsDirty
       }
       partitions_
     }
@@ -1303,8 +1333,10 @@ abstract class RDD[T: ClassTag](
     if (num == 0) {
       new Array[T](0)
     } else {
+      //sc.submitAndAdaptParents (this)
       val buf = new ArrayBuffer[T]
       val totalParts = this.partitions.length
+      println (s"num partitions ${totalParts}")
       var partsScanned = 0
       while (buf.size < num && partsScanned < totalParts) {
         // The number of partitions to try in this iteration. It is ok for this number to be

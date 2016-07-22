@@ -286,7 +286,7 @@ private[spark] class SqlNewHadoopRDD[V: ClassTag](
       preservesPartitioning: Boolean = false)
     extends RDD[U](prev) {
 
-    override val partitioner = if (preservesPartitioning) firstParent[T].partitioner else None
+    setPartitioner(if (preservesPartitioning) firstParent[T].partitioner else None)
 
     override def getPartitions: Array[SparkPartition] = firstParent[T].partitions
 

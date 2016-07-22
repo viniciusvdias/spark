@@ -178,6 +178,8 @@ class DAGScheduler(
   /** If enabled, FetchFailed will not cause stage retry, in order to surface the problem. */
   private val disallowStageRetryForTest = sc.getConf.getBoolean("spark.test.noStageRetry", false)
 
+  private val adaptiveExecEnabled = sc.getConf.getBoolean("spark.core.adaptive.enabled", false)
+
   private val messageScheduler =
     ThreadUtils.newDaemonSingleThreadScheduledExecutor("dag-scheduler-message")
 
@@ -429,6 +431,147 @@ class DAGScheduler(
     }
     parents
   }
+
+  /****/
+  
+
+  /**
+   * Clients call prepare before submiting a result stage. If
+   * adaptive execution is enabled then map stages (and its parents) will be
+   * submitted independently and the RDD along the way may be adapted. This
+   * function imediately returns otherwise
+   */
+  def prepareRDD(rdd: RDD[_], callSite: CallSite, properties: Properties) = if (adaptiveExecEnabled) {
+    val parentShufDeps = getParentShuffleDeps(rdd)
+    println (s"Submiting and adapting parents for ${rdd}. Shuffle deps: ${parentShufDeps.mkString(" ")} Waiting stages: ${waitingStages.mkString(" ")}")
+    if (parentShufDeps.nonEmpty) {
+      val mapStagesStats = submitIndependentMapStages (parentShufDeps, callSite, properties)
+      maybeAdaptSubDAG (rdd, parentShufDeps, mapStagesStats)
+    }
+  }
+
+  /**
+   * Returns the imediate shuffle dependencies that must be
+   * satisfied in order to materialize the 'targetRdd'
+   */
+  private def getParentShuffleDeps(targetRdd: RDD[_]): Array[ShuffleDependency[_,_,_]] = {
+    var deps: List[ShuffleDependency[_,_,_]] = Nil
+    val waitingForVisit = new Stack[RDD[_]]
+    def visit(rdd: RDD[_]) {
+      for (dep <- rdd.dependencies) dep match {
+        case shufDep: ShuffleDependency[_,_,_] =>
+          deps = shufDep :: deps
+        case narrowDep: NarrowDependency[_] =>
+          waitingForVisit.push(narrowDep.rdd)
+      }
+    }
+    waitingForVisit.push(targetRdd)
+    while (waitingForVisit.nonEmpty) {
+      visit(waitingForVisit.pop)
+    }
+    deps.toArray
+  }
+
+  /**
+   * This function submits parent stages of 'shufDep', observes the map
+   * statistics and then actually submits the map stage corresponding to
+   * 'shufDep'
+   */
+  private def submitMapStageAfterParents(shufDep: ShuffleDependency[_,_,_],
+        callSite: CallSite, properties: Properties)
+    : SimpleFutureAction[MapOutputStatistics] = {
+    
+    val parentShufDeps = getParentShuffleDeps (shufDep.rdd)
+    if (parentShufDeps.nonEmpty) { // ready for submission
+      val mapStagesStats = submitIndependentMapStages(parentShufDeps, callSite, properties)
+      // plan the submission of 'shufDep' which is now eligible for submission
+      maybeAdaptSubDAG (shufDep.rdd, parentShufDeps, mapStagesStats)
+    }
+    mapStageSubmissionFuture (shufDep, callSite, properties)
+  }
+
+  /**
+   * Auxiliary function that submits a shuffle map stage (i.e. its dependency)
+   * and returns a future holding 'MapOutputStatistics' as result
+   */
+  private def mapStageSubmissionFuture(shufDep: ShuffleDependency[_,_,_],
+      callSite: CallSite, properties: Properties): SimpleFutureAction[MapOutputStatistics] = {
+    // submit shuffle dep
+    var result: MapOutputStatistics = null
+    val callback = (r: MapOutputStatistics) => { result = r }
+    val waiter = submitMapStage (shufDep, callback, callSite, properties)
+    new SimpleFutureAction[MapOutputStatistics](waiter, result)
+  }
+
+  /**
+   * Submit map stages concurrently but before, make sure all parents for all
+   * stages are ready (submitted and finished). This functions returns
+   * 'MapOutputStatistics' indexed by the input shuffle dependencies.
+   */
+  private def submitIndependentMapStages(shuffleDeps: Array[ShuffleDependency[_,_,_]],
+      callSite: CallSite, properties: Properties): Array[MapOutputStatistics] = {
+    // get futures
+    val mapStagesFutures = new Array[SimpleFutureAction[MapOutputStatistics]](shuffleDeps.length)
+    var i = 0
+    while (i < shuffleDeps.length) {
+      mapStagesFutures(i) = submitMapStageAfterParents(shuffleDeps(i), callSite, properties)
+      i += 1
+    }
+
+    // synchronize futures, get results
+    val mapStagesStats = new Array[MapOutputStatistics](shuffleDeps.length)
+    var j = 0
+    while (j < mapStagesStats.length) {
+      mapStagesStats(j) = mapStagesFutures(j).get
+      j += 1
+    }
+
+    mapStagesStats
+  }
+
+  /**
+   * Maybe adapt 'finalRdd' and its narrow upstream dependencies based on the
+   * observed map stage statistics of the shuffle dependencies.
+   */
+  private def maybeAdaptSubDAG(finalRdd: RDD[_],
+      parentShufDeps: Array[ShuffleDependency[_,_,_]],
+      mapStagesStats: Array[MapOutputStatistics]): Unit = {
+
+    println (s"adapting subDag: ${parentShufDeps.map(_.rdd).mkString("[ ", " ; ", " ]")}")
+    
+    // sanity check that all partitioners of shuffle deps adapted together are
+    // the same
+    val parent = parentShufDeps.head.partitioner
+    assert (parentShufDeps.map(_.partitioner == parent).reduce (_ && _))
+
+    // setup a coalesced partitioner
+    val step = (parent.numPartitions / sc.defaultParallelism) max 1
+    var partitionStartIndices = new Array[Int](sc.defaultParallelism min parent.numPartitions)
+    partitionStartIndices(0) = 0
+    for (i <- 1 until partitionStartIndices.length)
+      partitionStartIndices(i) = partitionStartIndices(i - 1) + step
+    val part = new CoalescedPartitioner(parent, partitionStartIndices)
+
+    // find which rdds must be adapted with this new partitioner
+    // for instance, we proactively set the partitioner for all rdds that have a
+    // narrow relation with 'finalRdd', inclusive itself
+    var rddsToAdapt: List[RDD[_]] = Nil
+    def visit(rdd: RDD[_]): Unit = {
+      rddsToAdapt = rdd :: rddsToAdapt
+      for (dep <- rdd.dependencies) dep match {
+        case shufDep: ShuffleDependency[_,_,_] =>
+          assert (rdd.dependencies.toSet == parentShufDeps.toSet)
+        case narrowDep: NarrowDependency[_] =>
+          visit (dep.rdd)
+      }
+    }
+    visit(finalRdd)
+   
+    // set partitioner for all
+    rddsToAdapt.foreach (_.setPartitioner(part))
+
+  }
+  /****/
 
   private def getMissingParentStages(stage: Stage): List[Stage] = {
     val missing = new HashSet[Stage]

@@ -18,6 +18,7 @@
 package org.apache.spark
 
 import java.io.{IOException, ObjectInputStream, ObjectOutputStream}
+import java.util.{Arrays, Objects}
 
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
@@ -36,6 +37,8 @@ import org.apache.spark.util.random.{XORShiftRandom, SamplingUtils}
 abstract class Partitioner extends Serializable {
   def numPartitions: Int
   def getPartition(key: Any): Int
+  def startIdx(idx: Int): Int = idx
+  def endIdx(idx: Int): Int = idx + 1
 }
 
 object Partitioner {
@@ -59,10 +62,19 @@ object Partitioner {
     for (r <- bySize if r.partitioner.isDefined && r.partitioner.get.numPartitions > 0) {
       return r.partitioner.get
     }
-    if (rdd.context.conf.contains("spark.default.parallelism")) {
-      new HashPartitioner(rdd.context.defaultParallelism)
+    new HashPartitioner(getDefaultParallelism(rdd, bySize))
+  }
+
+  /**
+   * Determines the default parallelism taking into account adaptive execution
+   */
+  private def getDefaultParallelism(rdd: RDD[_], bySize: Seq[RDD[_]]): Int = {
+    if (rdd.context.conf.getBoolean("spark.core.adaptive.enabled", false)) {
+      rdd.context.conf.getInt("spark.core.adaptive.default.parallelism", 2000)
+    } else if (rdd.context.conf.contains("spark.default.parallelism")) {
+      rdd.context.defaultParallelism
     } else {
-      new HashPartitioner(bySize.head.partitions.size)
+      bySize.head.partitions.size
     }
   }
 }
@@ -93,6 +105,61 @@ class HashPartitioner(partitions: Int) extends Partitioner {
   }
 
   override def hashCode: Int = numPartitions
+}
+
+/**
+ * A Partitioner that might group together one or more partitions from the parent.
+ *
+ * @param parent a parent partitioner
+ * @param partitionStartIndices indices of partitions in parent that should create new partitions
+ *   in child (this should be an array of increasing partition IDs). For example, if we have a
+ *   parent with 5 partitions, and partitionStartIndices is [0, 2, 4], we get three output
+ *   partitions, corresponding to partition ranges [0, 1], [2, 3] and [4] of the parent partitioner.
+ */
+class CoalescedPartitioner(val parent: Partitioner, val partitionStartIndices: Array[Int])
+  extends Partitioner {
+
+  def this(parent: Partitioner) {
+    this(parent, (0 until parent.numPartitions).toArray)
+  }
+
+  println (s"indices: ${partitionStartIndices.mkString(" ")}")
+
+  @transient private lazy val parentPartitionMapping: Array[Int] = {
+    val n = parent.numPartitions
+    val result = new Array[Int](n)
+    for (i <- 0 until partitionStartIndices.length) {
+      val start = partitionStartIndices(i)
+      val end = if (i < partitionStartIndices.length - 1) partitionStartIndices(i + 1) else n
+      for (j <- start until end) {
+        result(j) = i
+      }
+    }
+    result
+  }
+
+  override def numPartitions: Int = partitionStartIndices.size
+
+  override def getPartition(key: Any): Int = {
+    parentPartitionMapping(parent.getPartition(key))
+  }
+
+  override def startIdx(idx: Int): Int = partitionStartIndices(idx)
+
+  override def endIdx(idx: Int): Int = {
+    if (idx < partitionStartIndices.length - 1) partitionStartIndices(idx + 1)
+    else parent.numPartitions
+  }
+
+  override def hashCode(): Int =
+    31 * Objects.hashCode(parent) + Arrays.hashCode(partitionStartIndices)
+
+  override def equals(other: Any): Boolean = other match {
+    case c: CoalescedPartitioner =>
+      c.parent == parent && Arrays.equals(c.partitionStartIndices, partitionStartIndices)
+    case _ =>
+      false
+  }
 }
 
 /**

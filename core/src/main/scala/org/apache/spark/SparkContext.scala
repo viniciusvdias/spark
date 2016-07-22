@@ -1812,6 +1812,15 @@ class SparkContext(config: SparkConf) extends Logging with ExecutorAllocationCli
   }
 
   /**
+   * Ask DAGScheduler to prepare parent shuffle map stages before the actual
+   * submission of this RDD(job). The actual submission of RDD is responsability
+   * of the caller
+   */
+  def prepareRDD(rdd: RDD[_]) {
+    dagScheduler.prepareRDD(rdd, getCallSite, localProperties.get)
+  }
+
+  /**
    * Run a function on a given set of partitions in an RDD and pass the results to the given
    * handler function. This is the main entry point for all actions in Spark.
    */
@@ -1919,6 +1928,7 @@ class SparkContext(config: SparkConf) extends Logging with ExecutorAllocationCli
    * Run a job on all partitions in an RDD and return the results in an array.
    */
   def runJob[T, U: ClassTag](rdd: RDD[T], func: (TaskContext, Iterator[T]) => U): Array[U] = {
+    prepareRDD (rdd)
     runJob(rdd, func, 0 until rdd.partitions.length)
   }
 
@@ -1926,6 +1936,7 @@ class SparkContext(config: SparkConf) extends Logging with ExecutorAllocationCli
    * Run a job on all partitions in an RDD and return the results in an array.
    */
   def runJob[T, U: ClassTag](rdd: RDD[T], func: Iterator[T] => U): Array[U] = {
+    prepareRDD (rdd)
     runJob(rdd, func, 0 until rdd.partitions.length)
   }
 
@@ -1937,6 +1948,7 @@ class SparkContext(config: SparkConf) extends Logging with ExecutorAllocationCli
     processPartition: (TaskContext, Iterator[T]) => U,
     resultHandler: (Int, U) => Unit)
   {
+    prepareRDD (rdd)
     runJob[T, U](rdd, processPartition, 0 until rdd.partitions.length, resultHandler)
   }
 
@@ -1948,6 +1960,7 @@ class SparkContext(config: SparkConf) extends Logging with ExecutorAllocationCli
       processPartition: Iterator[T] => U,
       resultHandler: (Int, U) => Unit)
   {
+    prepareRDD (rdd)
     val processFunc = (context: TaskContext, iter: Iterator[T]) => processPartition(iter)
     runJob[T, U](rdd, processFunc, 0 until rdd.partitions.length, resultHandler)
   }
