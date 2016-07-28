@@ -1,0 +1,26 @@
+# 1. Choose OS (Ubuntu 14.04.3 LTS Server Edition 64bit, ~2 CORE, 7.5GB RAM)
+sudo: required
+dist: trusty
+
+# 2. Choose language and target JDKs for parallel builds.
+language: scala
+jdk:
+  - oraclejdk7
+
+# 3. Setup cache directory for SBT and Maven.
+cache:
+  directories:
+  - $HOME/.sbt
+  - $HOME/.m2
+  - $HOME/.ivy2
+
+# 4. Turn off notifications.
+notifications:
+  email: false
+
+env: SBT_OPTS="-Xmx5G"
+
+# 6. Run test
+script:
+  - build/sbt -Pyarn -Phadoop-2.6 -Dhadoop.version=2.6.0 -Phive -Phive-thriftserver -DskipTests compile
+  - build/sbt "project core" "test-quick org.apache.spark.rdd.PairRDDFunctionsSuite"
