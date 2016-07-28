@@ -3,7 +3,7 @@ sudo: required
 dist: trusty
 
 # 2. Choose language and target JDKs for parallel builds.
-language: scala
+language: java
 jdk:
   - oraclejdk7
 
